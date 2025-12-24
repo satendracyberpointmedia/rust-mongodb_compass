@@ -5,3 +5,5 @@ pub mod aggregation;
 pub mod index;
 pub mod crud;
 pub mod performance;
+pub mod change_streams;
+pub mod index_management;

@@ -7,12 +7,19 @@ use app::state::AppState;
 use std::collections::HashMap;
 
 fn main() {
+    // Initialize static event storage
+    app::state::CHANGE_STREAM_EVENTS.set(Arc::new(Mutex::new(HashMap::new())))
+        .expect("Failed to initialize change stream events storage");
+    
     tauri::Builder::default()
         .manage(AppState {
             clients: std::sync::Mutex::new(HashMap::new()),
             connections: std::sync::Mutex::new(HashMap::new()),
             cursors: std::sync::Mutex::new(HashMap::new()),
             query_history: std::sync::Mutex::new(Vec::new()),
+            change_streams: std::sync::Mutex::new(HashMap::new()),
+            change_stream_senders: std::sync::Mutex::new(HashMap::new()),
+            change_stream_events: std::sync::Mutex::new(HashMap::new()),
         })
         .invoke_handler(tauri::generate_handler![
             // Connection Management
@@ -45,6 +52,20 @@ fn main() {
             app::commands::get_query_history,
             app::commands::clear_query_history,
             app::commands::delete_query_history_entry,
+            // Change Streams (Real-time Monitoring)
+            app::commands::start_change_stream,
+            app::commands::stop_change_stream,
+            app::commands::list_change_streams,
+            app::commands::get_change_stream_events,
+            app::commands::clear_change_stream_events,
+            app::commands::poll_change_stream_events,
+            // Index Management
+            app::commands::create_index,
+            app::commands::drop_index,
+            app::commands::drop_all_indexes,
+            app::commands::rebuild_indexes,
+            app::commands::get_index_usage_stats,
+            app::commands::get_index_recommendations,
         ])
         .run(tauri::generate_context!())
         .expect("error running NovaDB Studio");

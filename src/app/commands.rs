@@ -3,11 +3,13 @@ use uuid::Uuid;
 use serde_json::Value;
 use mongodb::bson::Document;
 use std::time::Instant;
+use futures::StreamExt;
 
-use crate::app::state::{AppState, ConnectionInfo, QueryHistoryEntry};
-use crate::mongo::{client, query, aggregation, index, crud, performance};
+use crate::app::state::{AppState, ConnectionInfo, QueryHistoryEntry, ChangeStreamInfo};
+use crate::mongo::{client, query, aggregation, index, crud, performance, change_streams, index_management};
 use crate::mongo::cursor_engine::CursorSession;
 use crate::utils::{json, export};
+use tokio::sync::mpsc;
 
 // ==================== Connection Management ====================
 
@@ -543,4 +545,332 @@ pub async fn delete_query_history_entry(
     let mut history = state.query_history.lock().map_err(|e| format!("Lock error: {}", e))?;
     history.retain(|entry| entry.id != entry_id);
     Ok(())
+}
+
+// ==================== Change Streams (Real-time Monitoring) ====================
+
+#[tauri::command]
+pub async fn start_change_stream(
+    connection_id: String,
+    db: String,
+    collection: Option<String>,
+    filter: Option<Value>,
+    operation_types: Option<Vec<String>>,
+    state: State<'_, AppState>
+) -> Result<String, String> {
+    let client = get_client(&state, &connection_id)?;
+    let stream_id = Uuid::new_v4().to_string();
+    
+    let (tx, _rx) = mpsc::unbounded_channel::<Value>();
+    
+    let stream = if let Some(coll_name) = &collection {
+        // Watch collection
+        let coll = client.database(&db).collection::<Document>(coll_name);
+        let filter_doc = filter.as_ref().map(|f| json::json_to_bson(f.clone())).transpose()?;
+        change_streams::watch_collection(coll, filter_doc, operation_types.clone()).await
+            .map_err(|e| format!("Failed to start change stream: {}", e))?
+    } else {
+        // Watch database
+        let database = client.database(&db);
+        let filter_doc = filter.as_ref().map(|f| json::json_to_bson(f.clone())).transpose()?;
+        change_streams::watch_database(database, filter_doc, operation_types.clone()).await
+            .map_err(|e| format!("Failed to start change stream: {}", e))?
+    };
+    
+    // Store change stream info
+    let stream_info = ChangeStreamInfo {
+        id: stream_id.clone(),
+        connection_id: connection_id.clone(),
+        database: db,
+        collection: collection.clone(),
+        filter: filter.clone(),
+        operation_types: operation_types.unwrap_or_default(),
+        started_at: chrono::Utc::now(),
+        is_active: true,
+    };
+    
+    state.change_streams.lock().map_err(|e| format!("Lock error: {}", e))?.insert(stream_id.clone(), stream_info);
+    state.change_stream_senders.lock().map_err(|e| format!("Lock error: {}", e))?.insert(stream_id.clone(), tx);
+    
+    // Initialize event storage in both state and static storage
+    state.change_stream_events.lock().map_err(|e| format!("Lock error: {}", e))?.insert(stream_id.clone(), Vec::new());
+    
+    if let Some(static_events) = crate::app::state::CHANGE_STREAM_EVENTS.get() {
+        static_events.lock().map_err(|e| format!("Lock error: {}", e))?.insert(stream_id.clone(), Vec::new());
+    }
+    
+    // Create channel for events
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Value>();
+    state.change_stream_senders.lock().map_err(|e| format!("Lock error: {}", e))?.insert(stream_id.clone(), event_tx.clone());
+    
+    // Background task to store events from channel into static storage
+    let stream_id_storage = stream_id.clone();
+    if let Some(static_events) = crate::app::state::CHANGE_STREAM_EVENTS.get() {
+        let events_storage = Arc::clone(static_events);
+        tokio::spawn(async move {
+            while let Some(event) = event_rx.recv().await {
+                if let Ok(mut events_map) = events_storage.lock() {
+                    if let Some(events) = events_map.get_mut(&stream_id_storage) {
+                        events.push(event);
+                        if events.len() > 1000 {
+                            events.remove(0);
+                        }
+                    }
+                }
+            }
+        });
+    }
+    
+    // Start listening to change stream
+    let stream_id_listen = stream_id.clone();
+    use std::sync::Arc;
+    let streams_arc = Arc::new(state.change_streams);
+    tokio::spawn(async move {
+        let mut stream = stream;
+        while let Some(change_result) = stream.next().await {
+            match change_result {
+                Ok(change_event) => {
+                    if let Ok(change_value) = serde_json::to_value(&change_event) {
+                        let _ = event_tx.send(change_value);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Change stream error: {}", e);
+                    if let Ok(mut streams) = streams_arc.lock() {
+                        if let Some(stream_info) = streams.get_mut(&stream_id_listen) {
+                            stream_info.is_active = false;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    });
+    
+    Ok(stream_id)
+}
+
+#[tauri::command]
+pub async fn stop_change_stream(
+    stream_id: String,
+    state: State<'_, AppState>
+) -> Result<(), String> {
+    // Mark as inactive
+    if let Some(stream_info) = state.change_streams.lock().map_err(|e| format!("Lock error: {}", e))?.get_mut(&stream_id) {
+        stream_info.is_active = false;
+    }
+    
+    state.change_streams.lock().map_err(|e| format!("Lock error: {}", e))?.remove(&stream_id);
+    state.change_stream_senders.lock().map_err(|e| format!("Lock error: {}", e))?.remove(&stream_id);
+    state.change_stream_events.lock().map_err(|e| format!("Lock error: {}", e))?.remove(&stream_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_change_streams(
+    connection_id: Option<String>,
+    state: State<'_, AppState>
+) -> Result<Vec<Value>, String> {
+    let streams = state.change_streams.lock().map_err(|e| format!("Lock error: {}", e))?;
+    
+    let filtered: Vec<&ChangeStreamInfo> = if let Some(conn_id) = connection_id {
+        streams.values().filter(|s| s.connection_id == conn_id).collect()
+    } else {
+        streams.values().collect()
+    };
+    
+    let result: Result<Vec<Value>, String> = filtered
+        .into_iter()
+        .map(|s| serde_json::to_value(s)
+            .map_err(|e| format!("Failed to serialize stream info: {}", e)))
+        .collect();
+    
+    result
+}
+
+#[tauri::command]
+pub async fn get_change_stream_events(
+    stream_id: String,
+    limit: Option<usize>,
+    state: State<'_, AppState>
+) -> Result<Vec<Value>, String> {
+    // Get stored events from static storage (updated by background task)
+    if let Some(static_events) = crate::app::state::CHANGE_STREAM_EVENTS.get() {
+        let events_map = static_events.lock().map_err(|e| format!("Lock error: {}", e))?;
+        
+        if let Some(events) = events_map.get(&stream_id) {
+            let limit_val = limit.unwrap_or(100);
+            let result: Vec<Value> = events
+                .iter()
+                .rev() // Most recent first
+                .take(limit_val)
+                .cloned()
+                .collect();
+            
+            // Also sync to state for consistency
+            drop(events_map);
+            let mut state_events = state.change_stream_events.lock().map_err(|e| format!("Lock error: {}", e))?;
+            if let Some(state_events_vec) = state_events.get_mut(&stream_id) {
+                *state_events_vec = static_events.lock().map_err(|e| format!("Lock error: {}", e))?.get(&stream_id).cloned().unwrap_or_default();
+            }
+            
+            return Ok(result);
+        }
+    }
+    
+    Ok(Vec::new())
+}
+
+// Helper command to poll and store events (call this periodically from frontend)
+#[tauri::command]
+pub async fn poll_change_stream_events(
+    stream_id: String,
+    state: State<'_, AppState>
+) -> Result<usize, String> {
+    // Try to receive events from channel and store them
+    let senders = state.change_stream_senders.lock().map_err(|e| format!("Lock error: {}", e))?;
+    
+    // Note: We can't receive from the channel here as it's owned by the background task
+    // Events are stored automatically when they arrive
+    // This is a placeholder - in production, use Tauri events or WebSockets
+    
+    let events_map = state.change_stream_events.lock().map_err(|e| format!("Lock error: {}", e))?;
+    Ok(events_map.get(&stream_id).map(|e| e.len()).unwrap_or(0))
+}
+
+#[tauri::command]
+pub async fn clear_change_stream_events(
+    stream_id: String,
+    state: State<'_, AppState>
+) -> Result<(), String> {
+    let mut events_map = state.change_stream_events.lock().map_err(|e| format!("Lock error: {}", e))?;
+    if let Some(events) = events_map.get_mut(&stream_id) {
+        events.clear();
+    }
+    Ok(())
+}
+
+// ==================== Index Management ====================
+
+#[tauri::command]
+pub async fn create_index(
+    connection_id: String,
+    db: String,
+    collection: String,
+    keys: Value,
+    name: Option<String>,
+    unique: Option<bool>,
+    sparse: Option<bool>,
+    background: Option<bool>,
+    expire_after_seconds: Option<i64>,
+    partial_filter: Option<Value>,
+    state: State<'_, AppState>
+) -> Result<String, String> {
+    let client = get_client(&state, &connection_id)?;
+    let coll = client.database(&db).collection::<Document>(&collection);
+    
+    let keys_doc: Document = json::json_to_bson(keys)?;
+    let partial_filter_doc = partial_filter.map(|f| json::json_to_bson(f)).transpose()?;
+    
+    let index_name = index_management::create_index_with_options(
+        coll,
+        keys_doc,
+        name,
+        unique,
+        sparse,
+        background,
+        expire_after_seconds,
+        partial_filter_doc,
+        None,
+        None,
+    ).await.map_err(|e| e.to_string())?;
+    
+    Ok(index_name)
+}
+
+#[tauri::command]
+pub async fn drop_index(
+    connection_id: String,
+    db: String,
+    collection: String,
+    index_name: String,
+    state: State<'_, AppState>
+) -> Result<(), String> {
+    let client = get_client(&state, &connection_id)?;
+    let coll = client.database(&db).collection::<Document>(&collection);
+    
+    index_management::drop_index(coll, index_name).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn drop_all_indexes(
+    connection_id: String,
+    db: String,
+    collection: String,
+    state: State<'_, AppState>
+) -> Result<(), String> {
+    let client = get_client(&state, &connection_id)?;
+    let coll = client.database(&db).collection::<Document>(&collection);
+    
+    index_management::drop_all_indexes(coll).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn rebuild_indexes(
+    connection_id: String,
+    db: String,
+    collection: String,
+    state: State<'_, AppState>
+) -> Result<(), String> {
+    let client = get_client(&state, &connection_id)?;
+    let coll = client.database(&db).collection::<Document>(&collection);
+    
+    index_management::rebuild_indexes(coll).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_index_usage_stats(
+    connection_id: String,
+    db: String,
+    collection: String,
+    state: State<'_, AppState>
+) -> Result<Vec<Value>, String> {
+    let client = get_client(&state, &connection_id)?;
+    let coll = client.database(&db).collection::<Document>(&collection);
+    
+    let stats = index_management::analyze_index_usage(coll).await.map_err(|e| e.to_string())?;
+    
+    let result: Result<Vec<Value>, String> = stats
+        .into_iter()
+        .map(|doc| serde_json::to_value(doc)
+            .map_err(|e| format!("Failed to convert stats to JSON: {}", e)))
+        .collect();
+    
+    result
+}
+
+#[tauri::command]
+pub async fn get_index_recommendations(
+    connection_id: String,
+    db: String,
+    collection: String,
+    sample_size: Option<usize>,
+    state: State<'_, AppState>
+) -> Result<Vec<Value>, String> {
+    let client = get_client(&state, &connection_id)?;
+    let coll = client.database(&db).collection::<Document>(&collection);
+    
+    let recommendations = index_management::get_index_recommendations(coll, sample_size)
+        .await.map_err(|e| e.to_string())?;
+    
+    let result: Result<Vec<Value>, String> = recommendations
+        .into_iter()
+        .map(|doc| serde_json::to_value(doc)
+            .map_err(|e| format!("Failed to convert recommendation to JSON: {}", e)))
+        .collect();
+    
+    result
 }
