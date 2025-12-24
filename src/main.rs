@@ -14,8 +14,12 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             app::commands::connect_db,
+            app::commands::disconnect_db,
             app::commands::list_databases,
+            app::commands::list_collections,
             app::commands::start_find,
+            app::commands::start_aggregate,
+            app::commands::list_indexes,
             app::commands::fetch_next,
             app::commands::cancel_query,
         ])
